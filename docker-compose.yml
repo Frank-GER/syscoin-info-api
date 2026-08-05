@@ -1,0 +1,20 @@
+#version: '3.8'
+
+# NOTE: Use Docker's default bridge (docker0, 172.17.0.0/16) so RPC
+# from the container matches syscoind rpcallowip=172.17.0.0/16 on the host.
+# Reach Syscoin Core via host.docker.internal -> host gateway (172.17.0.1).
+
+services:
+  api:
+    container_name: supply-api
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: syscoin/sys-supply-api
+    restart: always
+    network_mode: bridge
+    env_file: config/env
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    ports:
+      - 3050:3000
