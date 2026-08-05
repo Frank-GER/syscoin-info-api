@@ -45,6 +45,38 @@ const explorerApi = axios.create({
 });
 
 /**
+ * Parse NEVM coinsupply from explorer.
+ * Supports:
+ * - bare JSON number in SYS (Blockscout < v11 / Syscoin explorers today)
+ * - Blockscout envelope { status, message, result } (v11.0.1+)
+ *   where result is already in coin units (Wei.to(:ether) before render), not wei
+ *   https://docs.blockscout.com/devs/apis/rpc/stats
+ */
+function parseNevmCoinSupply(data) {
+  if (typeof data === "number") {
+    if (!Number.isFinite(data) || data < 0) {
+      throw new Error(`Invalid nevmSupply (bare number): ${data}`);
+    }
+    return data;
+  }
+
+  if (data && typeof data === "object") {
+    if (data.status !== "1" || typeof data.result !== "string") {
+      throw new Error(
+        `Invalid nevmSupply response structure or status: ${JSON.stringify(data)}`
+      );
+    }
+    const nevmSupply = parseFloat(data.result);
+    if (isNaN(nevmSupply) || nevmSupply < 0 || !Number.isFinite(nevmSupply)) {
+      throw new Error(`Could not parse nevmSupply result: ${data.result}`);
+    }
+    return nevmSupply;
+  }
+
+  throw new Error(`Unsupported nevmSupply response type: ${typeof data}`);
+}
+
+/**
  * Calls gettxoutsetinfo on UTXO JSON-RPC
  */
 async function getTxOutSetInfo() {
@@ -92,12 +124,8 @@ const getSupply = async () => {
 
   // Extract data and validate
   const utxoSupply = supplyInfo.total_amount; // Already validated in getTxOutSetInfo
-  const nevmSupply = explorerResponse.data;
+  const nevmSupply = parseNevmCoinSupply(explorerResponse.data);
   const nevmAdd = nevmAddResponse.data;
-
-  if (typeof nevmSupply !== 'number' || nevmSupply < 0) {
-    throw new Error(`Invalid nevmSupply (explorer): ${nevmSupply}`);
-  }
 
   if (!nevmAdd || nevmAdd.status !== "1" || typeof nevmAdd.result !== 'string') {
     throw new Error(`Invalid nevmAdd response structure or status: ${JSON.stringify(nevmAdd)}`);
