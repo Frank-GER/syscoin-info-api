@@ -40,6 +40,8 @@ This service expects a **Syscoin Core node already running** on the host (or els
 - `SYSCOIN_VAULT_MANAGER` — override the SyscoinVaultManager contract address (default in `config.js`)
 - `PORT` — HTTP listen port (default `3000`)
 - `POLLING_INTERVAL_SECONDS` — how often supply is recalculated (default `30`)
+- `TOTAL_SUPPLY_URL` — primary NEVM coinsupply explorer URL (default `explorer1.syscoin.org`)
+- `TOTAL_SUPPLY_URL_BACKUP` — fallback coinsupply URL if primary fails (default `explorer2.syscoin.org`)
 
 Generate RPC credentials for `syscoin.conf`:
 

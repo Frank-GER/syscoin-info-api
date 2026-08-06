@@ -4,9 +4,12 @@ const express = require("express");
 const app = express();
 const port = process.env.PORT || 3000;
 const CONFIGURATION = require("./config");
-// temp use explorer1.syscoin.org until explorer2 is fixed
-const TOTAL_SUPPLY_URL =
-  "https://explorer.syscoin.org/api?module=stats&action=coinsupply";
+const TOTAL_SUPPLY_URLS = [
+  process.env.TOTAL_SUPPLY_URL ||
+    "https://explorer1.syscoin.org/api?module=stats&action=coinsupply",
+  process.env.TOTAL_SUPPLY_URL_BACKUP ||
+    "https://explorer2.syscoin.org/api?module=stats&action=coinsupply",
+];
 const CONTRACT_BALANCE_URL =
   `https://explorer.syscoin.org/api?module=account&action=balance&address=${CONFIGURATION.SyscoinVaultManager}`;
 
@@ -77,6 +80,27 @@ function parseNevmCoinSupply(data) {
 }
 
 /**
+ * Fetch NEVM coinsupply, trying primary then backup URL on HTTP/parse failure.
+ */
+async function fetchNevmCoinSupply(urls) {
+  let lastError;
+  for (const url of urls) {
+    try {
+      const response = await explorerApi.get(url);
+      const value = parseNevmCoinSupply(response.data);
+      return { value, url };
+    } catch (error) {
+      const status = error.response ? ` status=${error.response.status}` : "";
+      lastError = new Error(
+        `NEVM total supply remote=${url}${status} failed: ${error.message}`
+      );
+      console.warn(lastError.message);
+    }
+  }
+  throw lastError || new Error("NEVM total supply: no URLs configured");
+}
+
+/**
  * Calls gettxoutsetinfo on UTXO JSON-RPC
  */
 async function getTxOutSetInfo() {
@@ -110,12 +134,9 @@ async function getTxOutSetInfo() {
 
 const getSupply = async () => {
   console.log("Fetching total supply components...");
-  const [supplyInfo, explorerResponse, nevmAddResponse] = await Promise.all([
+  const [supplyInfo, nevmSupplyResult, nevmAddResponse] = await Promise.all([
     getTxOutSetInfo(),
-    explorerApi.get(TOTAL_SUPPLY_URL).catch((error) => {
-      const status = error.response ? ` status=${error.response.status}` : "";
-      throw new Error(`NEVM total supply remote=${TOTAL_SUPPLY_URL}${status} failed: ${error.message}`);
-    }),
+    fetchNevmCoinSupply(TOTAL_SUPPLY_URLS),
     explorerApi.get(CONTRACT_BALANCE_URL).catch((error) => {
       const status = error.response ? ` status=${error.response.status}` : "";
       throw new Error(`NEVM contract balance remote=${CONTRACT_BALANCE_URL}${status} failed: ${error.message}`);
@@ -124,7 +145,7 @@ const getSupply = async () => {
 
   // Extract data and validate
   const utxoSupply = supplyInfo.total_amount; // Already validated in getTxOutSetInfo
-  const nevmSupply = parseNevmCoinSupply(explorerResponse.data);
+  const nevmSupply = nevmSupplyResult.value;
   const nevmAdd = nevmAddResponse.data;
 
   if (!nevmAdd || nevmAdd.status !== "1" || typeof nevmAdd.result !== 'string') {
@@ -135,7 +156,12 @@ const getSupply = async () => {
   const nevmContract = parseFloat(nevmAddContractSupply) / largeNumber;
   if (isNaN(nevmContract)) throw new Error(`Could not parse nevmAddContractSupply: ${nevmAddContractSupply}`);
 
-  console.log({ utxoSupply, nevmSupply, nevmContract });
+  console.log({
+    utxoSupply,
+    nevmSupply,
+    nevmSupplyUrl: nevmSupplyResult.url,
+    nevmContract,
+  });
   const cmcSupply = nevmSupply - nevmContract + utxoSupply;
   if (isNaN(cmcSupply) || cmcSupply < 0) throw new Error(`Calculated cmcSupply is invalid: ${cmcSupply}`);
 
