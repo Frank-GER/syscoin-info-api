@@ -1,4 +1,4 @@
-FROM node:fermium
+FROM node:24-bookworm-slim
 
 WORKDIR /app
 
@@ -13,4 +13,4 @@ COPY ./config.js ./config.js
 
 EXPOSE 3000
 
-CMD node index.js
+CMD ["node", "index.js"]

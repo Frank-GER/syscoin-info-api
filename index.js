@@ -1,11 +1,15 @@
-require("dotenv").config();
+require("dotenv").config({ path: `${__dirname}/config/env` });
 const axios = require('axios');
 const express = require("express");
 const app = express();
 const port = process.env.PORT || 3000;
 const CONFIGURATION = require("./config");
-const TOTAL_SUPPLY_URL =
-  "https://explorer-v5.syscoin.org/api?module=stats&action=coinsupply";
+const TOTAL_SUPPLY_URLS = [
+  process.env.TOTAL_SUPPLY_URL ||
+    "https://explorer1.syscoin.org/api?module=stats&action=coinsupply",
+  process.env.TOTAL_SUPPLY_URL_BACKUP ||
+    "https://explorer2.syscoin.org/api?module=stats&action=coinsupply",
+];
 const CONTRACT_BALANCE_URL =
   `https://explorer.syscoin.org/api?module=account&action=balance&address=${CONFIGURATION.SyscoinVaultManager}`;
 
@@ -21,7 +25,6 @@ let lastRecordedCirculatingSupply = {
 let lastAttemptError = {
   totalSupply: undefined, // String description of the last error, or undefined if last attempt was successful
   circulatingSupply: undefined, // String description of the last error, or undefined if last attempt was successful
-  recordedAt: undefined, // Timestamp of the last error occurrence (or last successful attempt)
 };
 const largeNumber = 1000000000000000000;
 
@@ -43,6 +46,59 @@ const rpc = axios.create({
 const explorerApi = axios.create({
   timeout: 8000
 });
+
+/**
+ * Parse NEVM coinsupply from explorer.
+ * Supports:
+ * - bare JSON number in SYS (Blockscout < v11 / Syscoin explorers today)
+ * - Blockscout envelope { status, message, result } (v11.0.1+)
+ *   where result is already in coin units (Wei.to(:ether) before render), not wei
+ *   https://docs.blockscout.com/devs/apis/rpc/stats
+ */
+function parseNevmCoinSupply(data) {
+  if (typeof data === "number") {
+    if (!Number.isFinite(data) || data < 0) {
+      throw new Error(`Invalid nevmSupply (bare number): ${data}`);
+    }
+    return data;
+  }
+
+  if (data && typeof data === "object") {
+    if (data.status !== "1" || typeof data.result !== "string") {
+      throw new Error(
+        `Invalid nevmSupply response structure or status: ${JSON.stringify(data)}`
+      );
+    }
+    const nevmSupply = parseFloat(data.result);
+    if (isNaN(nevmSupply) || nevmSupply < 0 || !Number.isFinite(nevmSupply)) {
+      throw new Error(`Could not parse nevmSupply result: ${data.result}`);
+    }
+    return nevmSupply;
+  }
+
+  throw new Error(`Unsupported nevmSupply response type: ${typeof data}`);
+}
+
+/**
+ * Fetch NEVM coinsupply, trying primary then backup URL on HTTP/parse failure.
+ */
+async function fetchNevmCoinSupply(urls) {
+  let lastError;
+  for (const url of urls) {
+    try {
+      const response = await explorerApi.get(url);
+      const value = parseNevmCoinSupply(response.data);
+      return { value, url };
+    } catch (error) {
+      const status = error.response ? ` status=${error.response.status}` : "";
+      lastError = new Error(
+        `NEVM total supply remote=${url}${status} failed: ${error.message}`
+      );
+      console.warn(lastError.message);
+    }
+  }
+  throw lastError || new Error("NEVM total supply: no URLs configured");
+}
 
 /**
  * Calls gettxoutsetinfo on UTXO JSON-RPC
@@ -78,27 +134,19 @@ async function getTxOutSetInfo() {
 
 const getSupply = async () => {
   console.log("Fetching total supply components...");
-  try {
-    const [supplyInfo, explorerResponse, nevmAddResponse] = await Promise.all([
-      getTxOutSetInfo(),
-      explorerApi.get(TOTAL_SUPPLY_URL).catch((error) => {
-        const status = error.response ? ` status=${error.response.status}` : "";
-        throw new Error(`NEVM total supply remote=${TOTAL_SUPPLY_URL}${status} failed: ${error.message}`);
-      }),
-      explorerApi.get(CONTRACT_BALANCE_URL).catch((error) => {
-        const status = error.response ? ` status=${error.response.status}` : "";
-        throw new Error(`NEVM contract balance remote=${CONTRACT_BALANCE_URL}${status} failed: ${error.message}`);
-      }),
-    ]);
+  const [supplyInfo, nevmSupplyResult, nevmAddResponse] = await Promise.all([
+    getTxOutSetInfo(),
+    fetchNevmCoinSupply(TOTAL_SUPPLY_URLS),
+    explorerApi.get(CONTRACT_BALANCE_URL).catch((error) => {
+      const status = error.response ? ` status=${error.response.status}` : "";
+      throw new Error(`NEVM contract balance remote=${CONTRACT_BALANCE_URL}${status} failed: ${error.message}`);
+    }),
+  ]);
 
   // Extract data and validate
   const utxoSupply = supplyInfo.total_amount; // Already validated in getTxOutSetInfo
-  const nevmSupply = explorerResponse.data;
+  const nevmSupply = nevmSupplyResult.value;
   const nevmAdd = nevmAddResponse.data;
-
-  if (typeof nevmSupply !== 'number' || nevmSupply < 0) {
-    throw new Error(`Invalid nevmSupply (explorer-v5): ${nevmSupply}`);
-  }
 
   if (!nevmAdd || nevmAdd.status !== "1" || typeof nevmAdd.result !== 'string') {
     throw new Error(`Invalid nevmAdd response structure or status: ${JSON.stringify(nevmAdd)}`);
@@ -108,33 +156,17 @@ const getSupply = async () => {
   const nevmContract = parseFloat(nevmAddContractSupply) / largeNumber;
   if (isNaN(nevmContract)) throw new Error(`Could not parse nevmAddContractSupply: ${nevmAddContractSupply}`);
 
-  console.log({ utxoSupply, nevmSupply, nevmContract });
+  console.log({
+    utxoSupply,
+    nevmSupply,
+    nevmSupplyUrl: nevmSupplyResult.url,
+    nevmContract,
+  });
   const cmcSupply = nevmSupply - nevmContract + utxoSupply;
   if (isNaN(cmcSupply) || cmcSupply < 0) throw new Error(`Calculated cmcSupply is invalid: ${cmcSupply}`);
 
   console.log("Total supply components fetched and calculated successfully."); // Add logging
   return cmcSupply;
-  } catch (error) {
-    // Log the specific error causing getSupply to fail
-    console.error(`Error in getSupply calculation/fetching: ${error.message}`);
-    // Re-throw to be caught by the recording function
-    throw error;
-  }
-};
-
-const getCirculatingSupply = async () => {
-  console.log("Fetching circulating supply components...");
-  // Check dependency on successfully recorded total supply
-  if (lastRecordedTotalSupply.value === undefined) {
-    console.warn("Cannot calculate circulating supply: Total supply has never been successfully recorded.");
-    throw new Error("Dependency Error: Total Supply unavailable");
-  }
-
-  const treasuryBalance = 0; // Treasury is now factored into sys5 governance/utxo
-  const finalCirculatingSupply = lastRecordedTotalSupply.value - treasuryBalance;
-
-  console.log("Circulating supply calculated successfully.");
-  return finalCirculatingSupply;
 };
 
 const recordTotalSupply = async () => {
@@ -146,7 +178,6 @@ const recordTotalSupply = async () => {
     lastRecordedTotalSupply.value = supply;
     lastRecordedTotalSupply.recordedAt = getUnixtimestamp();
     lastAttemptError.totalSupply = undefined; // Clear error on success
-    lastAttemptError.recordedAt = getUnixtimestamp();
     console.log(`Total supply recorded successfully: ${supply} at ${new Date(lastRecordedTotalSupply.recordedAt * 1000).toISOString()}`);
 
   } catch (error) {
@@ -154,19 +185,17 @@ const recordTotalSupply = async () => {
     const errorMessage = `Failed to record total supply: ${error.message || "Unknown error"}`;
     console.error(errorMessage);
     lastAttemptError.totalSupply = errorMessage; // Store the error message
-    lastAttemptError.recordedAt = getUnixtimestamp();
     // DO NOT update lastRecordedTotalSupply.value or .recordedAt
   }
 };
 
-const recordCirculatingSupply = async () => {
+const recordCirculatingSupply = () => {
   console.log("Attempting to record circulating supply...");
   // Check dependency: Has total supply *ever* been recorded successfully?
   if (lastRecordedTotalSupply.value === undefined) {
     const errorMessage = "Skipped: Total supply has never been recorded.";
     console.warn(errorMessage);
     lastAttemptError.circulatingSupply = errorMessage;
-    lastAttemptError.recordedAt = getUnixtimestamp();
     return; // Don't proceed
   }
   // Check dependency: Did the *last attempt* to get total supply fail?
@@ -174,29 +203,14 @@ const recordCirculatingSupply = async () => {
     const errorMessage = "Skipped: Last total supply fetch failed.";
     console.warn(errorMessage);
     lastAttemptError.circulatingSupply = errorMessage;
-    lastAttemptError.recordedAt = getUnixtimestamp();
     return; // Don't proceed
   }
 
-  try {
-    const supply = await getCirculatingSupply(); // Can throw errors
-
-    // Success Case: Update value and clear specific error
-    lastRecordedCirculatingSupply.value = supply;
-    lastRecordedCirculatingSupply.recordedAt = getUnixtimestamp();
-    lastAttemptError.circulatingSupply = undefined; // Clear error on success
-    lastAttemptError.recordedAt = getUnixtimestamp();
-    console.log(`Circulating supply recorded successfully: ${supply} at ${lastRecordedCirculatingSupply.recordedAt}`);
-
-  } catch (error) {
-    // Failure Case: Log, update error state, *keep existing value*
-    const errorMessage = `Failed to record circulating supply: ${error.message || "Unknown error"}`;
-    console.error(errorMessage);
-    if (error.response) console.error(" -> Axios Response Error Data:", error.response.data);
-    lastAttemptError.circulatingSupply = errorMessage; // Store the error message
-    lastAttemptError.recordedAt = getUnixtimestamp();
-    // DO NOT update lastRecordedCirculatingSupply.value or .recordedAt
-  }
+  const supply = lastRecordedTotalSupply.value;
+  lastRecordedCirculatingSupply.value = supply;
+  lastRecordedCirculatingSupply.recordedAt = getUnixtimestamp();
+  lastAttemptError.circulatingSupply = undefined;
+  console.log(`Circulating supply recorded successfully: ${supply} at ${lastRecordedCirculatingSupply.recordedAt}`);
 };
 
 const runRecordingCycle = async () => {
@@ -232,23 +246,19 @@ app.get("/circulatingsupply", (req, res) => {
 
 app.get("/triggerRecordSupply", async (req, res) => {
   console.log("Manual trigger received: Recording supply...");
-  await recordTotalSupply();
-  await recordCirculatingSupply();
-  // Send the state objects *after* the calls
-  res
-    .status(200)
-    .send(JSON.stringify({
-      newRecordedSupply: lastRecordedTotalSupply,
-      newCirculatingSupply: lastRecordedCirculatingSupply
-    }));
+  await runRecordingCycle();
+  res.status(200).json({
+    newRecordedSupply: lastRecordedTotalSupply,
+    newCirculatingSupply: lastRecordedCirculatingSupply,
+  });
 });
 
-app.get("/health", async (req, res) => {
+app.get("/health", (req, res) => {
   console.log("Health check", new Date());
   res.status(200).send("OK");
 });
 
-app.get("/status", async (req, res) => {
+app.get("/status", (req, res) => {
   if (undefined !== lastAttemptError.circulatingSupply || undefined !== lastAttemptError.totalSupply) {
     res.status(200).json({
       status: "ERROR",
@@ -276,19 +286,19 @@ const server = app.listen(port, async () => {
   // --- Periodic Polling ---
   const POLLING_INTERVAL_SECONDS = process.env.POLLING_INTERVAL_SECONDS ? parseInt(process.env.POLLING_INTERVAL_SECONDS, 10) : 30; // Default 30 seconds
   const POLLING_INTERVAL_MS = POLLING_INTERVAL_SECONDS * 1000;
+  let pollingInterval;
   if (POLLING_INTERVAL_MS > 0) { // Avoid interval of 0 or less
     console.log(`Starting supply polling every ${POLLING_INTERVAL_SECONDS} seconds.`);
-    const pollingInterval = setInterval(runRecordingCycle, POLLING_INTERVAL_MS);
+    pollingInterval = setInterval(runRecordingCycle, POLLING_INTERVAL_MS);
   } else {
     console.log("Polling interval is set to 0 or less. Polling disabled after initial fetch.");
   }
 
   const shutdown = (signal) => {
     console.log(`${signal} signal received: Shutting down server...`);
-    console.log('Attempting to stop polling interval (if active)...'); // Best effort log
-    if (pollingInterval) { // If stored locally
+    if (pollingInterval) {
       clearInterval(pollingInterval);
-      console.log('Polling stopped.');
+      console.log("Polling stopped.");
     }
 
     server.close((err) => { // Close the HTTP server
